@@ -847,7 +847,29 @@ func (pc *PeerConnection) CreateAnswer(*AnswerOptions) (SessionDescription, erro
 	if err != nil {
 		return SessionDescription{}, err
 	}
-
+	// remove inactive media sections
+	var inactiveMidValue []string
+	for _, media := range d.MediaDescriptions {
+		if media.MediaName.Media == mediaSectionApplication {
+			continue
+		}
+		if media.MediaName.Port.Value == 0 {
+			var midValue string
+			var inactive bool
+			for _, attr := range media.Attributes {
+				if attr.Key == sdp.AttrKeyInactive {
+					inactive = true
+				}
+				if attr.Key == sdp.AttrKeyMID {
+					midValue = attr.Value
+				}
+			}
+			if inactive {
+				inactiveMidValue = append(inactiveMidValue, midValue)
+			}
+		}
+	}
+	pc.removeRTPTransceiver(inactiveMidValue)
 	desc := SessionDescription{
 		Type:   SDPTypeAnswer,
 		SDP:    string(sdpBytes),
@@ -2264,6 +2286,31 @@ func (pc *PeerConnection) addRTPTransceiver(t *RTPTransceiver) {
 	pc.onNegotiationNeeded()
 }
 
+// removeRTPTransceiver remove inactive
+// and fires onNegotiationNeeded;
+// caller of this method should hold `pc.mu` lock
+func (pc *PeerConnection) removeRTPTransceiver(mids []string) {
+	if len(mids) == 0 {
+		return
+	}
+	n := 0
+	for _, transceiver := range pc.rtpTransceivers {
+		needDelete := false
+		for _, mid := range mids {
+			if transceiver.Mid() == mid {
+				transceiver.Stop()
+				needDelete = true
+			}
+		}
+		if !needDelete {
+			pc.rtpTransceivers[n] = transceiver
+			n++
+		}
+	}
+	pc.rtpTransceivers = pc.rtpTransceivers[:n]
+	pc.onNegotiationNeeded()
+}
+
 // CurrentLocalDescription represents the local description that was
 // successfully negotiated the last time the PeerConnection transitioned
 // into the stable state plus any local candidates that have been generated
@@ -2628,7 +2675,16 @@ func (pc *PeerConnection) generateMatchedSDP(transceivers []*RTPTransceiver, use
 			mediaTransceivers := []*RTPTransceiver{t}
 
 			extensions, _ := rtpExtensionsFromMediaDescription(media)
-			mediaSections = append(mediaSections, mediaSection{id: midValue, transceivers: mediaTransceivers, matchExtensions: extensions, rids: getRids(media)})
+			rejected := false
+			if media.MediaName.Port.Value == 0 {
+				for _, attr := range media.Attributes {
+					if attr.Key == sdp.AttrKeyInactive {
+						rejected = true
+						break
+					}
+				}
+			}
+			mediaSections = append(mediaSections, mediaSection{id: midValue, transceivers: mediaTransceivers, matchExtensions: extensions, rids: getRids(media), rejected: rejected})
 		}
 	}
 
